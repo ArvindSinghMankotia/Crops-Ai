@@ -82,10 +82,11 @@ String getSensorData() {
   String data = "{";
   data += "\"temperature\": " + String(temperature, 1) + ",";
   data += "\"humidity\": " + String(humidity, 1) + ",";
-  data += "\"soil_moisture\": " + String(map(soilMoisture, 0, 4095, 100, 0)); // Inverted: 0 = wet, 4095 = dry
+  data += "\"soil_moisture\": " + String(map(soilMoisture, 0, 4095, 0, 100)); // 0 = dry, 100 = wet
   data += "}";
   return data;
 }
+
 
 String getWeatherData(String location) {
   HTTPClient http;
