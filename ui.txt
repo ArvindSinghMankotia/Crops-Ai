@@ -1,0 +1,833 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <HTTPClient.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+
+const char* ssid = "ketox";  // Replace with your WiFi SSID
+const char* password = "";   // Add password if required
+const char* weatherApiKey = "66bc6dc00aa6c882b37801e36968757c"; // Your OpenWeatherMap key
+const char* geminiApiKey = "AIzaSyDccW7_NuAU8ThIqmzD5-qDICqosIs5NJU"; // Your Gemini key
+const char* geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
+WebServer server(80);
+
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+#define SOIL_MOISTURE_PIN 34
+#define LED_BUILTIN 2
+
+bool ledState = false;
+int manualMoistureValue = 50;  // Default manual moisture value
+bool manualModeEnabled = false;  // Flag to control manual mode
+
+struct CropData {
+  String cropType;
+  String location;
+  String plantingDate;
+};
+CropData crops[10];
+int cropCount = 0;
+
+void setupSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+  loadCropData();
+}
+
+void loadCropData() {
+  File file = SPIFFS.open("/crops.json", "r");
+  if (!file) return;
+
+  DynamicJsonDocument doc(512);
+  deserializeJson(doc, file);
+  cropCount = doc["count"];
+  for (int i = 0; i < cropCount; i++) {
+    crops[i].cropType = doc["crops"][i]["type"].as<String>();
+    crops[i].location = doc["crops"][i]["location"].as<String>();
+    crops[i].plantingDate = doc["crops"][i]["date"].as<String>();
+  }
+  file.close();
+}
+
+void saveCropData() {
+  File file = SPIFFS.open("/crops.json", "w");
+  if (!file) return;
+
+  DynamicJsonDocument doc(512);
+  doc["count"] = cropCount;
+  JsonArray cropArray = doc.createNestedArray("crops");
+  for (int i = 0; i < cropCount; i++) {
+    JsonObject crop = cropArray.createNestedObject();
+    crop["type"] = crops[i].cropType;
+    crop["location"] = crops[i].location;
+    crop["date"] = crops[i].plantingDate;
+  }
+  serializeJson(doc, file);
+  file.close();
+}
+
+String getSensorData() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  int soilMoisturePercent;
+  
+  if (manualModeEnabled) {
+    // Use manually set value
+    soilMoisturePercent = manualMoistureValue;
+  } else {
+    // Simulate soil moisture based on temperature and humidity
+    static int lastMoisture = 50;  // Start at 50%
+    float tempEffect = (30 - temperature) / 2;  // Temperature effect (30°C is neutral)
+    float humEffect = (humidity - 50) / 4;      // Humidity effect (50% is neutral)
+    
+    // Calculate new moisture with some natural variation
+    soilMoisturePercent = lastMoisture + tempEffect + humEffect + random(-2, 3);
+    soilMoisturePercent = constrain(soilMoisturePercent, 0, 100);  // Keep between 0-100%
+    lastMoisture = soilMoisturePercent;  // Save for next reading
+  }
+  
+  // Debug sensor readings
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 1);
+  Serial.print(" °C | Humidity: ");
+  Serial.print(humidity, 1);
+  Serial.print(" % | ");
+  Serial.print(manualModeEnabled ? "Manual" : "Simulated");
+  Serial.print(" Soil Moisture: ");
+  Serial.print(soilMoisturePercent);
+  Serial.println("%");
+
+  if (isnan(temperature) || isnan(humidity)) {
+    return "{\"error\": \"DHT sensor reading failed\"}";
+  }
+
+  // Create JSON string
+  String data = "{";
+  data += "\"temperature\": " + String(temperature, 1) + ",";
+  data += "\"humidity\": " + String(humidity, 1) + ",";
+  data += "\"soil_moisture\": " + String(soilMoisturePercent) + ",";
+  data += "\"manual_mode\": " + String(manualModeEnabled ? "true" : "false");
+  data += "}";
+  return data;
+}
+
+
+String getWeatherData(String location) {
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + location + "&appid=" + String(weatherApiKey) + "&units=metric";
+  http.begin(url);
+  http.setTimeout(10000);
+  int httpCode = http.GET();
+  String payload = "{}";
+  if (httpCode == HTTP_CODE_OK) {
+    payload = http.getString();
+  } else {
+    Serial.println("Weather API failed, code: " + String(httpCode));
+    payload = "{\"error\": \"Weather data unavailable, code: " + String(httpCode) + "\"}";
+  }
+  http.end();
+  return payload;
+}
+
+String getCropData(String cropType, String location) {
+  String cropData = "{}";
+  for (int i = 0; i < cropCount; i++) {
+    if (crops[i].cropType == cropType && crops[i].location == location) {
+      cropData = "{\"type\": \"" + crops[i].cropType + "\", \"location\": \"" + crops[i].location + "\", \"plantingDate\": \"" + crops[i].plantingDate + "\"}";
+      break;
+    }
+  }
+  return cropData;
+}
+
+String getAISuggestions(String cropType, String location) {
+  HTTPClient http;
+  Serial.println("Attempting Gemini API call: " + String(geminiUrl));
+  http.begin(String(geminiUrl) + "?key=" + String(geminiApiKey));
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/json");
+
+  String sensorData = getSensorData();
+  String weatherData = getWeatherData(location);
+  String cropData = getCropData(cropType, location);
+
+  String prompt = "Given the following data:\n- Sensor Data: " + sensorData + "\n- Weather Data: " + weatherData + "\n- Crop Data: " + cropData + "\nProvide smart irrigation and farming suggestions based on current conditions, historical crop data, and weather forecasts. Include pest management tips if applicable. Format the response under three headings: 'Suggestions', 'Must Do', 'Should You Water the Fields Now (Yes/No)'.";
+
+  DynamicJsonDocument doc(512);
+  doc["contents"][0]["parts"][0]["text"] = prompt;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+  Serial.println("Request Body: " + requestBody);
+
+  int httpCode = http.POST(requestBody);
+  String response;
+  if (httpCode == HTTP_CODE_OK) {
+    String rawResponse = http.getString();
+    Serial.println("Raw Response: " + rawResponse);
+
+    DynamicJsonDocument resDoc(512);
+    DeserializationError error = deserializeJson(resDoc, rawResponse);
+    if (!error && resDoc.containsKey("candidates") && resDoc["candidates"][0]["content"]["parts"][0]["text"]) {
+      String suggestions = resDoc["candidates"][0]["content"]["parts"][0]["text"].as<String>();
+      suggestions.replace("\n", "\\n");
+      suggestions.replace("\"", "\\\"");
+      DynamicJsonDocument outDoc(512);
+      outDoc["suggestions"] = suggestions;
+      outDoc["sensorData"] = sensorData;
+      serializeJson(outDoc, response);
+    } else {
+      response = "{\"error\":\"Invalid Gemini response\",\"sensorData\":" + sensorData + "}";
+      Serial.println("Parse Error: " + String(error.c_str()));
+    }
+  } else {
+    response = "{\"error\":\"Gemini API failed, code: " + String(httpCode) + "\",\"sensorData\":" + sensorData + "}";
+    Serial.println("HTTP Code: " + String(httpCode));
+  }
+  Serial.println("Sent Response: " + response);
+  http.end();
+  return response;
+}
+
+String htmlPart1 = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Irrigation Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --primary-color: #2196F3;
+            --success-color: #4CAF50;
+            --warning-color: #FFC107;
+            --danger-color: #f44336;
+            --text-color: #333;
+            --bg-color: #f5f7fa;
+        }
+        
+        body { 
+            font-family: 'Segoe UI', Arial, sans-serif; 
+            background: var(--bg-color); 
+            margin: 0; 
+            padding: 20px;
+            color: var(--text-color);
+        }
+        
+        .container { 
+            max-width: 1200px; 
+            margin: auto; 
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            padding: 20px;
+        }
+        
+        .header {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #1e88e5, #1565c0);
+            color: white;
+            border-radius: 15px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 2.5em;
+            font-weight: 300;
+        }
+        
+        .card { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 15px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .card h2 { 
+            color: var(--primary-color);
+            margin-top: 0;
+            font-weight: 500;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        
+        .sensor-value { 
+            font-size: 2.5em; 
+            font-weight: 300; 
+            margin: 20px 0;
+            color: var(--primary-color);
+        }
+        
+        button { 
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 25px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: background 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        button:hover {
+            background: #1976D2;
+        }
+        
+        input[type="text"], input[type="date"] {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-sizing: border-box;
+            font-size: 1em;
+        }
+        
+        .chart-container {
+            position: relative;
+            margin: 20px 0;
+            height: 200px;
+        }
+        
+        /* AI Suggestions Styling */
+        .ai-card {
+            grid-column: 1 / -1;
+        }
+        
+        .ai-form {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            gap: 10px;
+            align-items: end;
+            margin-bottom: 20px;
+        }
+        
+        .ai-form input {
+            margin: 0;
+        }
+        
+        .suggestions-container {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .suggestion-section {
+            margin: 15px 0;
+            padding: 15px;
+            border-left: 4px solid var(--primary-color);
+            background: white;
+            border-radius: 0 10px 10px 0;
+        }
+        
+        .suggestion-section h3 {
+            color: var(--primary-color);
+            margin: 0 0 10px 0;
+        }
+        
+        /* Add Crop Form Styling */
+        .crop-form {
+            display: grid;
+            gap: 10px;
+        }
+        
+        /* Motor Control Styling */
+        .motor-status {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            margin-top: 10px;
+            font-weight: 500;
+        }
+        
+        .motor-on {
+            background: var(--success-color);
+            color: white;
+        }
+        
+        .motor-off {
+            background: #ddd;
+            color: var(--text-color);
+        }
+    </style>
+</head>
+<body onload="setupCharts()">
+    <div class="container">
+        <div class="header">
+            <h1>🌿 Smart Irrigation Dashboard 🌿</h1>
+        </div>
+        
+        <div class="card">
+            <h2>Temperature</h2>
+            <p id="tempValue" class="sensor-value">-- °C</p>
+            <div class="chart-container">
+                <canvas id="tempChart"></canvas>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Humidity</h2>
+            <p id="humValue" class="sensor-value">-- %</p>
+            <div class="chart-container">
+                <canvas id="humChart"></canvas>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Soil Moisture</h2>
+            <p id="soilValue" class="sensor-value">-- %</p>
+            <div class="chart-container">
+                <canvas id="soilChart"></canvas>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Motor Control</h2>
+            <button onclick="toggleLED()">Toggle Motor</button>
+            <p id="led-status" class="motor-status motor-off">Motor is OFF</p>
+        </div>
+        
+        <div class="card">
+            <h2>Add Crop</h2>
+            <form id="cropForm" class="crop-form">
+                <input type="text" id="cropType" placeholder="Crop Type" required>
+                <input type="text" id="location" placeholder="Location" required>
+                <input type="date" id="plantingDate" required>
+                <button type="submit">Add Crop</button>
+            </form>
+        </div>
+        
+        <div class="card ai-card">
+            <h2>AI Irrigation Assistant</h2>
+            <div class="ai-form">
+                <div>
+                    <label for="aiCrop">Crop Type</label>
+                    <input type="text" id="aiCrop" placeholder="Enter crop type" required>
+                </div>
+                <div>
+                    <label for="aiLocation">Location</label>
+                    <input type="text" id="aiLocation" placeholder="Enter location" required>
+                </div>
+                <button onclick="getSuggestions()">Get Recommendations</button>
+            </div>
+            <div id="suggestions" class="suggestions-container">
+                Click the button to get personalized recommendations
+            </div>
+        </div>
+    </div>
+)rawliteral";
+
+String htmlPart2 = R"rawliteral(
+    <script>
+        let tempData = [], humData = [], soilData = [], timeLabels = [];
+        let chart1, chart2, chart3;
+
+        function updateData() {
+            fetch('/data')
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) return;
+                let now = new Date().toLocaleTimeString();
+                
+                // Update data arrays
+                if (timeLabels.length > 10) {
+                    timeLabels.shift();
+                    tempData.shift();
+                    humData.shift();
+                    soilData.shift();
+                }
+                timeLabels.push(now);
+                tempData.push(data.temperature);
+                humData.push(data.humidity);
+                soilData.push(data.soil_moisture);
+
+                // Update display values
+                document.getElementById('tempValue').textContent = `${data.temperature.toFixed(1)} °C`;
+                document.getElementById('humValue').textContent = `${data.humidity.toFixed(1)} %`;
+                document.getElementById('soilValue').textContent = `${data.soil_moisture} %`;
+
+                // Update all charts
+                chart1.data.labels = timeLabels;
+                chart2.data.labels = timeLabels;
+                chart3.data.labels = timeLabels;
+                
+                chart1.data.datasets[0].data = tempData;
+                chart2.data.datasets[0].data = humData;
+                chart3.data.datasets[0].data = soilData;
+                
+                chart1.update('none');
+                chart2.update('none');
+                chart3.update('none');
+            });
+        }
+
+        function setupCharts() {
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: false,
+                        grid: { color: 'rgba(0,0,0,0.05)' }
+                    },
+                    x: {
+                        grid: { display: false }
+                    }
+                },
+                elements: {
+                    line: {
+                        tension: 0.4
+                    },
+                    point: {
+                        radius: 3
+                    }
+                }
+            };
+
+            let ctx1 = document.getElementById('tempChart').getContext('2d');
+            let ctx2 = document.getElementById('humChart').getContext('2d');
+            let ctx3 = document.getElementById('soilChart').getContext('2d');
+            
+            chart1 = new Chart(ctx1, {
+                type: 'line',
+                data: {
+                    labels: timeLabels,
+                    datasets: [{
+                        label: 'Temperature',
+                        data: tempData,
+                        borderColor: '#f44336',
+                        backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                        fill: true
+                    }]
+                },
+                options: chartOptions
+            });
+            
+            chart2 = new Chart(ctx2, {
+                type: 'line',
+                data: {
+                    labels: timeLabels,
+                    datasets: [{
+                        label: 'Humidity',
+                        data: humData,
+                        borderColor: '#2196F3',
+                        backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                        fill: true
+                    }]
+                },
+                options: chartOptions
+            });
+            
+            chart3 = new Chart(ctx3, {
+                type: 'line',
+                data: {
+                    labels: timeLabels,
+                    datasets: [{
+                        label: 'Soil Moisture',
+                        data: soilData,
+                        borderColor: '#4CAF50',
+                        backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                        fill: true
+                    }]
+                },
+                options: chartOptions
+            });
+            
+            setInterval(updateData, 2000);
+            updateData();
+        }
+
+        function toggleLED() {
+            fetch('/toggle')
+            .then(response => response.text())
+            .then(data => {
+                let status = document.getElementById('led-status');
+                status.textContent = data;
+                status.className = data.includes('ON') ? 
+                    'motor-status motor-on' : 'motor-status motor-off';
+            });
+        }
+
+        function formatSuggestions(suggestions) {
+            try {
+                let sections = suggestions.split('\n\n');
+                let html = '';
+                
+                sections.forEach(section => {
+                    if (section.trim()) {
+                        let [title, ...content] = section.split('\n');
+                        html += `
+                            <div class="suggestion-section">
+                                <h3>${title}</h3>
+                                <p>${content.join('<br>')}</p>
+                            </div>
+                        `;
+                    }
+                });
+                
+                return html || 'No specific suggestions available at this time.';
+            } catch (e) {
+                return suggestions;
+            }
+        }
+
+        function getSuggestions() {
+            let crop = document.getElementById('aiCrop').value;
+            let location = document.getElementById('aiLocation').value;
+            if (!crop || !location) {
+                document.getElementById('suggestions').innerHTML = 
+                    '<p style="color: var(--danger-color)">Please enter both crop type and location</p>';
+                return;
+            }
+            
+            document.getElementById('suggestions').innerHTML = 
+                '<p style="color: var(--primary-color)">Fetching recommendations...</p>';
+            
+            fetch(`/suggestions?crop=${encodeURIComponent(crop)}&location=${encodeURIComponent(location)}`)
+            .then(response => {
+                if (!response.ok) throw new Error('HTTP error ' + response.status);
+                return response.json();
+            })
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('suggestions').innerHTML = 
+                        `<p style="color: var(--danger-color)">Error: ${data.error}</p>`;
+                } else {
+                    document.getElementById('suggestions').innerHTML = 
+                        formatSuggestions(data.suggestions);
+                }
+            })
+            .catch(error => {
+                document.getElementById('suggestions').innerHTML = 
+                    `<p style="color: var(--danger-color)">Error: ${error.message}</p>`;
+            });
+        }
+
+        document.getElementById('cropForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            let cropType = document.getElementById('cropType').value;
+            let location = document.getElementById('location').value;
+            let plantingDate = document.getElementById('plantingDate').value;
+            fetch('/addCrop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cropType, location, plantingDate })
+            }).then(() => {
+                alert('Crop added successfully!');
+                this.reset();
+            });
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  String fullPage = htmlPart1 + htmlPart2;
+  server.send(200, "text/html", fullPage);
+}
+
+void handleData() {
+  server.send(200, "application/json", getSensorData());
+}
+
+void handleToggleLED() {
+  ledState = !ledState;
+  digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+  server.send(200, "text/plain", ledState ? "Motor is ON" : "Motor is OFF");
+}
+
+void handleAddCrop() {
+  if (server.method() == HTTP_POST) {
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, server.arg("plain"));
+    if (cropCount < 10) {
+      crops[cropCount].cropType = doc["cropType"].as<String>();
+      crops[cropCount].location = doc["location"].as<String>();
+      crops[cropCount].plantingDate = doc["plantingDate"].as<String>();
+      cropCount++;
+      saveCropData();
+      server.send(200, "text/plain", "Crop added");
+    } else {
+      server.send(400, "text/plain", "Crop limit reached");
+    }
+  }
+}
+
+void handleSuggestions() {
+  String crop = server.arg("crop");
+  String location = server.arg("location");
+  if (crop == "" || location == "") {
+    server.send(400, "application/json", "{\"error\": \"Crop type and location required\"}");
+    return;
+  }
+  String response = getAISuggestions(crop, location);
+  server.send(200, "application/json", response);
+}
+
+void handleSetMoisture() {
+  if (server.hasArg("value")) {
+    manualMoistureValue = server.arg("value").toInt();
+    manualMoistureValue = constrain(manualMoistureValue, 0, 100);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing value parameter");
+  }
+}
+
+void handleToggleManual() {
+  if (server.hasArg("enabled")) {
+    manualModeEnabled = (server.arg("enabled") == "true");
+    server.send(200, "text/plain", manualModeEnabled ? "Manual mode enabled" : "Manual mode disabled");
+  } else {
+    server.send(400, "text/plain", "Missing enabled parameter");
+  }
+}
+
+void handleAdmin() {
+  String adminPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sensor Admin Control</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; margin: 0; padding: 20px; }
+        .card { background: white; padding: 20px; margin: 20px auto; max-width: 500px; border-radius: 10px; box-shadow: 2px 2px 10px rgba(0, 0, 0, 0.1); }
+        h1 { color: #333; }
+        
+        /* Toggle switch style */
+        .switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+                 background-color: #ccc; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 26px; width: 26px;
+                        left: 4px; bottom: 4px; background-color: white; transition: .4s;
+                        border-radius: 50%; }
+        input:checked + .slider { background-color: #2196F3; }
+        input:checked + .slider:before { transform: translateX(26px); }
+        
+        /* Slider style */
+        input[type="range"] { width: 200px; margin: 10px 0; }
+        #currentValue { font-size: 24px; font-weight: bold; margin: 20px 0; color: #2196F3; }
+        .warning { color: #ff4444; font-size: 0.9em; margin-top: 20px; }
+        #sliderValue { font-size: 18px; color: #666; margin: 5px 0; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Sensor Admin Control</h1>
+        <div id="currentValue">Current Value: --</div>
+        
+        <div>
+            <label class="switch">
+                <input type="checkbox" id="manualToggle" onchange="toggleManual(this.checked)">
+                <span class="slider round"></span>
+            </label>
+            <label for="manualToggle">Manual Mode</label>
+        </div>
+        
+        <div style="margin-top: 20px;">
+            <input type="range" id="moistureSlider" min="0" max="100" value="50" 
+                   oninput="updateMoistureValue(this.value)" disabled>
+            <div id="sliderValue">50%</div>
+        </div>
+        
+        <p class="warning">Note: This page is for testing purposes only.</p>
+    </div>
+
+    <script>
+        function updateCurrentValue() {
+            fetch('/data')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('currentValue').textContent = 
+                    `Current Value: ${data.soil_moisture}%`;
+                document.getElementById('manualToggle').checked = data.manual_mode;
+                document.getElementById('moistureSlider').disabled = !data.manual_mode;
+                if (data.manual_mode) {
+                    document.getElementById('moistureSlider').value = data.soil_moisture;
+                    document.getElementById('sliderValue').textContent = data.soil_moisture + '%';
+                }
+            });
+        }
+
+        function toggleManual(enabled) {
+            fetch(`/toggleManual?enabled=${enabled}`)
+            .then(response => response.text())
+            .then(data => {
+                console.log(data);
+                document.getElementById('moistureSlider').disabled = !enabled;
+            });
+        }
+
+        function updateMoistureValue(value) {
+            document.getElementById('sliderValue').textContent = value + '%';
+            fetch(`/setMoisture?value=${value}`)
+            .then(response => response.text())
+            .then(data => console.log(data));
+        }
+
+        // Update current value every second
+        setInterval(updateCurrentValue, 1000);
+        // Initial update
+        updateCurrentValue();
+    </script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", adminPage);
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(SOIL_MOISTURE_PIN, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  setupSPIFFS();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! ESP32 IP: " + WiFi.localIP().toString());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/toggle", handleToggleLED);
+  server.on("/addCrop", handleAddCrop);
+  server.on("/suggestions", HTTP_GET, handleSuggestions);
+  server.on("/setMoisture", handleSetMoisture);
+  server.on("/toggleManual", handleToggleManual);
+  server.on("/admin", handleAdmin);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
