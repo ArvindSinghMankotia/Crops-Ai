@@ -7,8 +7,8 @@
 
 const char* ssid = "ketox";  
 const char* password = "";  
-const char* weatherApiKey = "66bc6dc00aa6c882b37801e36968757c"; 
-const char* geminiApiKey = "AIzaSyDccW7_NuAU8ThIqmzD5-qDICqosIs5NJU"; 
+const char* weatherApiKey = "66bc6dc00aa6c882b37801e36968757ce"; 
+const char* geminiApiKey = "AIzaSyDccW7_NuAU8ThIqmzD5-qDICqosIs5NJUe"; 
 const char* geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 
 WebServer server(80);
